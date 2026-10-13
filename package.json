@@ -1,0 +1,22 @@
+{
+  "name": "lumio-linked-roles",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lumio Discord Linked Roles backend with basic security and monitoring",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "audit": "npm audit",
+    "audit:production": "npm audit --omit=dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "helmet": "^8.1.0",
+    "express-rate-limit": "^8.1.0"
+  }
+}
