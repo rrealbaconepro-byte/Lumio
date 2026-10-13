@@ -17,6 +17,7 @@
  *   DISCORD_BOT_TOKEN
  *   SESSION_SECRET         use a long random value
  *   ADMIN_STATUS_KEY       long random key for /admin/status
+ *   OWNER_PANEL_PASSCODE   passcode required to enter /owner (set in Render, never commit)
  * Optional:
  *   BASE_URL               https://YOUR-SERVICE.onrender.com
  *   PORT                   supplied by Render
@@ -58,6 +59,7 @@ const REDIRECT_URI = process.env.DISCORD_REDIRECT_URI;
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const ADMIN_STATUS_KEY = process.env.ADMIN_STATUS_KEY;
+const OWNER_PANEL_PASSCODE = process.env.OWNER_PANEL_PASSCODE;
 const BASE_URL = process.env.BASE_URL || '';
 
 const REQUIRED_ENV = {
@@ -150,6 +152,13 @@ const globalLimiter = rateLimit({
     });
     res.status(options.statusCode).json(options.message);
   },
+});
+const ownerLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many owner-panel login attempts. Try again in 15 minutes.' },
 });
 const oauthLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -322,6 +331,64 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
     recentActions,
     recentErrors,
   });
+});
+
+// Owner panel: passcode is configured in Render as OWNER_PANEL_PASSCODE.
+// Do not hard-code it into source code or commit it to GitHub.
+app.get('/owner', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (req.session.ownerAuthenticated === true) {
+    return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Panel</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:24px;font:16px/1.55 system-ui,sans-serif;color:#183c32;background:linear-gradient(135deg,#b8efd7,#eefbf4 55%,#d4f6e6)}main{max-width:760px;margin:7vh auto;padding:clamp(24px,5vw,42px);border:1px solid #ffffffc9;border-radius:24px;background:#ffffffdf;box-shadow:0 24px 80px #28694b20}h1{margin-top:0}p{color:#54736a}.pill{display:inline-block;padding:5px 10px;border-radius:999px;background:#d9f7e7;color:#226b4e;font-weight:700}button{border:0;border-radius:12px;padding:11px 16px;background:#226b4e;color:white;font-weight:700;cursor:pointer}
+</style></head><body><main><span class="pill">Owner access</span><h1>Lumio Owner Panel</h1><p>You are signed into the owner panel for this browser session.</p><p>The owner panel foundation is ready. Member management, announcements, and suspension controls should be added with server-side authorization and an audit log before use.</p><form method="post" action="/owner/logout"><button type="submit">Lock owner panel</button></form></main></body></html>`);
+  }
+  return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Access</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;font:16px/1.55 system-ui,sans-serif;color:#183c32;background:radial-gradient(circle at 15% 15%,#e4fff1,transparent 34%),linear-gradient(135deg,#b8efd7,#eefbf4 55%,#d4f6e6)}main{width:min(480px,100%);padding:clamp(24px,6vw,42px);border:1px solid #ffffffc9;border-radius:24px;background:#ffffffdf;box-shadow:0 24px 80px #28694b20}h1{margin:0 0 10px;font-size:2rem}p{color:#54736a}label{display:block;margin:20px 0 7px;font-weight:700}input{width:100%;padding:13px;border:1px solid #b9d8c9;border-radius:12px;font:inherit}button{width:100%;margin-top:14px;border:0;border-radius:12px;padding:13px;background:#226b4e;color:white;font:inherit;font-weight:700;cursor:pointer}.error{color:#a52828}
+</style></head><body><main><h1>Lumio Owner Panel</h1><p>Enter the owner passcode to continue. This area is restricted.</p><form method="post" action="/owner/login"><label for="passcode">Owner passcode</label><input id="passcode" name="passcode" type="password" autocomplete="current-password" required maxlength="256" autofocus><button type="submit">Unlock owner panel</button></form></main></body></html>`);
+});
+
+app.post('/owner/login', ownerLoginLimiter, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
+  if (!OWNER_PANEL_PASSCODE) {
+    logEvent('error', { event: 'owner_panel_passcode_not_configured' });
+    return res.status(503).send('Owner panel is not configured yet. Set OWNER_PANEL_PASSCODE in Render Environment settings.');
+  }
+  if (!safeEqual(passcode, OWNER_PANEL_PASSCODE)) {
+    logEvent('security', { event: 'owner_panel_login_denied', ip: req.ip });
+    return res.status(401).type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access denied</title><body style="font:16px system-ui;max-width:520px;margin:12vh auto;padding:24px;color:#183c32"><h1>Incorrect passcode</h1><p>The passcode wasn't accepted. Return to the owner panel and try again.</p><p><a href="/owner">Back to owner login</a></p></body></html>`);
+  }
+  req.session.regenerate((err) => {
+    if (err) {
+      logEvent('error', { event: 'owner_panel_session_regeneration_failed' });
+      return res.status(500).send('Could not start a secure owner session. Please try again.');
+    }
+    req.session.ownerAuthenticated = true;
+    req.session.ownerAuthenticatedAt = Date.now();
+    logEvent('security', { event: 'owner_panel_login_success', ip: req.ip });
+    req.session.save((saveErr) => {
+      if (saveErr) {
+        logEvent('error', { event: 'owner_panel_session_save_failed' });
+        return res.status(500).send('Could not save the owner session. Please try again.');
+      }
+      res.redirect(303, '/owner');
+    });
+  });
+});
+
+app.post('/owner/logout', (req, res) => {
+  if (req.session) {
+    req.session.destroy(() => {
+      res.clearCookie('lumio.sid', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+      });
+      res.redirect(303, '/owner');
+    });
+    return;
+  }
+  res.redirect(303, '/owner');
 });
 
 // Begin OAuth2. State stored in the session protects against forged callbacks.
