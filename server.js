@@ -38,6 +38,8 @@ const session = require('express-session');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.disable('x-powered-by');
@@ -61,6 +63,8 @@ const SESSION_SECRET = process.env.SESSION_SECRET;
 const ADMIN_STATUS_KEY = process.env.ADMIN_STATUS_KEY;
 const OWNER_PANEL_PASSCODE = process.env.OWNER_PANEL_PASSCODE;
 const BASE_URL = process.env.BASE_URL || '';
+const DATA_DIR = process.env.LUMIO_DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'lumio-store.json');
 
 const REQUIRED_ENV = {
   DISCORD_CLIENT_ID: CLIENT_ID,
@@ -88,8 +92,62 @@ const traffic = {
 const recentActions = [];
 const recentErrors = [];
 const recentGuilds = { fetchedAt: null, items: [], error: null };
+const store = loadStore();
 const MAX_RECENT = 100;
 const HIGH_TRAFFIC_PER_MINUTE = Number(process.env.HIGH_TRAFFIC_PER_MINUTE) || 180;
+
+function loadStore() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    return {
+      users: Array.isArray(parsed.users) ? parsed.users : [],
+      audit: Array.isArray(parsed.audit) ? parsed.audit : [],
+    };
+  } catch {
+    return { users: [], audit: [] };
+  }
+}
+function saveStore() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, DATA_FILE);
+    return true;
+  } catch (err) {
+    logEvent('error', { event: 'store_save_failed', message: err.message });
+    return false;
+  }
+}
+function audit(action, details = {}) {
+  store.audit.unshift({ at: new Date().toISOString(), action, ...details });
+  if (store.audit.length > 500) store.audit.length = 500;
+  saveStore();
+  logEvent('action', { event: `owner_${action}`, ...details });
+}
+function requireOwner(req, res, next) {
+  if (req.session?.ownerAuthenticated !== true) {
+    return res.status(401).json({ error: 'Owner login required.' });
+  }
+  if (Date.now() - Number(req.session.ownerAuthenticatedAt || 0) > 60 * 60 * 1000) {
+    req.session.destroy(() => {});
+    return res.status(401).json({ error: 'Owner session expired. Log in again.' });
+  }
+  next();
+}
+function publicUser(user) {
+  return {
+    discordId: user.discordId,
+    username: user.username,
+    globalName: user.globalName || null,
+    avatar: user.avatar || null,
+    linkedAt: user.linkedAt,
+    suspended: Boolean(user.suspended),
+    suspensionReason: user.suspensionReason || null,
+    guilds: Array.isArray(user.guilds) ? user.guilds.map(g => ({ id: g.id, name: g.name })) : [],
+  };
+}
 
 function addRecent(list, item) {
   list.unshift(item);
@@ -262,26 +320,19 @@ async function discordRequest(path, options = {}) {
 }
 
 async function refreshGuildCache() {
-  if (!BOT_TOKEN) return;
-  try {
-    const guilds = await discordRequest('/users/@me/guilds?with_counts=true', {
-      headers: { Authorization: `Bot ${BOT_TOKEN}` },
-    });
-    recentGuilds.items = Array.isArray(guilds)
-      ? guilds.map(g => ({
-          id: g.id,
-          name: g.name,
-          approximate_member_count: Number.isFinite(g.approximate_member_count)
-            ? g.approximate_member_count : null,
-        }))
-      : [];
-    recentGuilds.fetchedAt = new Date().toISOString();
-    recentGuilds.error = null;
-    logEvent('action', { event: 'guild_cache_refreshed', guildCount: recentGuilds.items.length });
-  } catch (err) {
-    recentGuilds.error = 'Discord API request failed';
-    logEvent('error', { event: 'guild_cache_refresh_failed', message: err.message });
+  const guildMap = new Map();
+  for (const user of store.users) {
+    for (const guild of (user.guilds || [])) {
+      if (!guildMap.has(guild.id)) guildMap.set(guild.id, {
+        id: guild.id,
+        name: guild.name,
+        approximate_member_count: null,
+      });
+    }
   }
+  recentGuilds.items = [...guildMap.values()];
+  recentGuilds.fetchedAt = new Date().toISOString();
+  recentGuilds.error = null;
 }
 
 app.get('/', (_req, res) => {
@@ -337,14 +388,16 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
 // Do not hard-code it into source code or commit it to GitHub.
 app.get('/owner', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  if (req.session.ownerAuthenticated === true) {
-    return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Panel</title><style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:24px;font:16px/1.55 system-ui,sans-serif;color:#183c32;background:linear-gradient(135deg,#b8efd7,#eefbf4 55%,#d4f6e6)}main{max-width:760px;margin:7vh auto;padding:clamp(24px,5vw,42px);border:1px solid #ffffffc9;border-radius:24px;background:#ffffffdf;box-shadow:0 24px 80px #28694b20}h1{margin-top:0}p{color:#54736a}.pill{display:inline-block;padding:5px 10px;border-radius:999px;background:#d9f7e7;color:#226b4e;font-weight:700}button{border:0;border-radius:12px;padding:11px 16px;background:#226b4e;color:white;font-weight:700;cursor:pointer}
-</style></head><body><main><span class="pill">Owner access</span><h1>Lumio Owner Panel</h1><p>You are signed into the owner panel for this browser session.</p><p>The owner panel foundation is ready. Member management, announcements, and suspension controls should be added with server-side authorization and an audit log before use.</p><form method="post" action="/owner/logout"><button type="submit">Lock owner panel</button></form></main></body></html>`);
-  }
-  return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Access</title><style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;font:16px/1.55 system-ui,sans-serif;color:#183c32;background:radial-gradient(circle at 15% 15%,#e4fff1,transparent 34%),linear-gradient(135deg,#b8efd7,#eefbf4 55%,#d4f6e6)}main{width:min(480px,100%);padding:clamp(24px,6vw,42px);border:1px solid #ffffffc9;border-radius:24px;background:#ffffffdf;box-shadow:0 24px 80px #28694b20}h1{margin:0 0 10px;font-size:2rem}p{color:#54736a}label{display:block;margin:20px 0 7px;font-weight:700}input{width:100%;padding:13px;border:1px solid #b9d8c9;border-radius:12px;font:inherit}button{width:100%;margin-top:14px;border:0;border-radius:12px;padding:13px;background:#226b4e;color:white;font:inherit;font-weight:700;cursor:pointer}.error{color:#a52828}
-</style></head><body><main><h1>Lumio Owner Panel</h1><p>Enter the owner passcode to continue. This area is restricted.</p><form method="post" action="/owner/login"><label for="passcode">Owner passcode</label><input id="passcode" name="passcode" type="password" autocomplete="current-password" required maxlength="256" autofocus><button type="submit">Unlock owner panel</button></form></main></body></html>`);
+  if (req.session.ownerAuthenticated !== true) return res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Access</title><body style="font:16px system-ui;max-width:480px;margin:12vh auto;padding:24px;background:#e8f8ef;color:#183c32"><h1>Lumio Owner Panel</h1><p>Enter the owner passcode to continue.</p><form method="post" action="/owner/login"><label>Owner passcode <input name="passcode" type="password" autocomplete="current-password" required maxlength="256" style="display:block;width:100%;padding:12px;margin:8px 0"></label><button style="padding:12px;background:#226b4e;color:white;border:0;border-radius:10px">Unlock panel</button></form></body></html>`);
+  return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Panel</title><style>body{font:15px system-ui;margin:0;padding:20px;background:#e8f8ef;color:#183c32}main{max-width:1100px;margin:auto;background:#fff;padding:24px;border-radius:18px}section{margin:24px 0}.grid{display:flex;gap:12px;flex-wrap:wrap}.card{padding:14px;border:1px solid #cde4d6;border-radius:12px;min-width:150px}button{padding:9px 13px;border:0;border-radius:9px;background:#226b4e;color:#fff;cursor:pointer}button.danger{background:#9e2d2d}select,textarea{display:block;width:100%;box-sizing:border-box;padding:10px;margin:8px 0 14px;border:1px solid #bdd8c9;border-radius:9px}textarea{min-height:100px}table{border-collapse:collapse;width:100%;min-width:700px}td,th{text-align:left;padding:10px;border-bottom:1px solid #dcebe2}.wrap{overflow:auto}#notice{padding:10px;background:#eff9f2;white-space:pre-wrap}small{color:#60776c}</style></head><body><main><header style="display:flex;justify-content:space-between;align-items:center;gap:12px"><div><small>LUMIO / PRIVATE OWNER AREA</small><h1>Lumio Owner Panel</h1><p>Linked accounts, server announcements and moderation.</p></div><form method="post" action="/owner/logout"><button type="submit">Lock panel</button></form></header><p id="notice">Loading…</p><div class="grid"><div class="card">Linked accounts<h2 id="totalUsers">—</h2></div><div class="card">Suspended<h2 id="totalSuspended">—</h2></div><div class="card">Connected servers<h2 id="totalServers">—</h2></div></div><section><h2>Send a server announcement</h2><p><small>Choose one server and channel. The bot must be installed and have permission. Mentions are disabled.</small></p><label>Server<select id="server"><option value="">Choose server</option></select></label><label>Channel<select id="channel"><option value="">Choose a server first</option></select></label><label>Message<textarea id="message" maxlength="1800" placeholder="Write your announcement"></textarea></label><button id="send">Send announcement</button></section><section><h2>Linked accounts</h2><div class="wrap"><table><thead><tr><th>Account</th><th>Linked at</th><th>Servers</th><th>Status</th><th>Action</th></tr></thead><tbody id="users"><tr><td colspan="5">Loading…</td></tr></tbody></table></div></section><section><h2>Recent owner actions</h2><div class="wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead><tbody id="audit"></tbody></table></div></section>
+<script>
+const $=id=>document.getElementById(id);function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function note(s){$('notice').textContent=s}
+async function api(url,opts={}){const r=await fetch(url,{credentials:'same-origin',...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.error||'Request failed');return d}
+async function load(){try{const d=await api('/owner/api/overview');$('totalUsers').textContent=d.totals.linkedUsers;$('totalSuspended').textContent=d.totals.suspendedUsers;$('totalServers').textContent=d.totals.connectedServers;$('server').innerHTML='<option value="">Choose server</option>'+d.servers.map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+' ('+g.linkedAccounts+' linked)</option>').join('');$('users').innerHTML=d.users.length?d.users.map(u=>'<tr><td><b>'+esc(u.globalName||u.username)+'</b><br><small>'+esc(u.username)+' · '+esc(u.discordId)+'</small></td><td>'+esc(new Date(u.linkedAt).toLocaleString())+'</td><td>'+u.guilds.length+'</td><td>'+(u.suspended?'Suspended: '+esc(u.suspensionReason||''):'Active')+'</td><td>'+(u.suspended?'<button data-restore="'+esc(u.discordId)+'">Restore</button>':'<button class="danger" data-suspend="'+esc(u.discordId)+'">Suspend</button>')+'</td></tr>').join(''):'<tr><td colspan="5">No linked accounts yet.</td></tr>';$('audit').innerHTML=d.audit.map(a=>'<tr><td>'+esc(new Date(a.at).toLocaleString())+'</td><td>'+esc(a.action)+'</td><td><small>'+esc(Object.entries(a).filter(([k])=>!['at','action'].includes(k)).map(([k,v])=>k+': '+(typeof v==='string'?v:JSON.stringify(v))).join(' · '))+'</small></td></tr>').join('');note('Dashboard loaded.')}catch(e){note(e.message)}}
+$('server').onchange=async()=>{const id=$('server').value;$('channel').innerHTML='<option>Loading…</option>';if(!id){$('channel').innerHTML='<option value="">Choose a server first</option>';return}try{const d=await api('/owner/api/servers/'+encodeURIComponent(id)+'/channels');$('channel').innerHTML='<option value="">Choose channel</option>'+d.channels.map(c=>'<option value="'+esc(c.id)+'">#'+esc(c.name)+'</option>').join('')}catch(e){$('channel').innerHTML='<option value="">Could not load channels</option>';note(e.message)}};
+$('send').onclick=async()=>{const guildId=$('server').value,channelId=$('channel').value,content=$('message').value.trim();if(!guildId||!channelId||!content)return note('Choose a server, channel and message.');if(!confirm('Send this announcement to the selected channel?'))return;try{await api('/owner/api/messages',{method:'POST',body:JSON.stringify({guildId,channelId,content})});$('message').value='';note('Announcement sent.');load()}catch(e){note(e.message)}};
+document.addEventListener('click',async e=>{const s=e.target.closest('[data-suspend]'),r=e.target.closest('[data-restore]');try{if(s){const reason=prompt('Reason for suspending this Lumio-linked account:');if(!reason||!reason.trim()||!confirm('Suspend this account from Lumio linking?'))return;await api('/owner/api/users/'+s.dataset.suspend+'/suspend',{method:'POST',body:JSON.stringify({reason})});note('Account suspended from Lumio.');load()}if(r){if(!confirm('Restore this account’s Lumio access?'))return;await api('/owner/api/users/'+r.dataset.restore+'/restore',{method:'POST',body:'{}'});note('Account restored.');load()}}catch(err){note(err.message)}});load();
+</script></main></body></html>`);
 });
 
 app.post('/owner/login', ownerLoginLimiter, (req, res) => {
@@ -391,6 +444,91 @@ app.post('/owner/logout', (req, res) => {
   res.redirect(303, '/owner');
 });
 
+// Owner-only APIs. The bot can only send to servers/channels where it is installed
+// and has the required Discord permissions. This does not DM members or access unrelated servers.
+app.get('/owner/api/overview', requireOwner, (_req, res) => {
+  const users = store.users.map(publicUser);
+  const guildMap = new Map();
+  for (const user of store.users) {
+    for (const guild of (user.guilds || [])) {
+      if (!guildMap.has(guild.id)) guildMap.set(guild.id, { id: guild.id, name: guild.name, linkedAccounts: 0 });
+      guildMap.get(guild.id).linkedAccounts += 1;
+    }
+  }
+  res.set('Cache-Control', 'no-store').json({
+    totals: { linkedUsers: users.length, suspendedUsers: users.filter(u => u.suspended).length, connectedServers: guildMap.size },
+    users,
+    servers: [...guildMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    audit: store.audit.slice(0, 100),
+  });
+});
+
+app.get('/owner/api/servers/:guildId/channels', requireOwner, async (req, res) => {
+  const guildId = String(req.params.guildId || '');
+  if (!/^\d{17,22}$/.test(guildId)) return res.status(400).json({ error: 'Invalid server ID.' });
+  const linkedToLumio = store.users.some(u => (u.guilds || []).some(g => g.id === guildId));
+  if (!linkedToLumio) return res.status(403).json({ error: 'This server is not in the linked-account server list.' });
+  try {
+    const guild = await discordRequest(`/guilds/${guildId}`, { headers: { Authorization: `Bot ${BOT_TOKEN}` } });
+    const channels = await discordRequest(`/guilds/${guildId}/channels`, { headers: { Authorization: `Bot ${BOT_TOKEN}` } });
+    const textChannels = (Array.isArray(channels) ? channels : [])
+      .filter(ch => [0, 5].includes(ch.type))
+      .map(ch => ({ id: ch.id, name: ch.name, type: ch.type }));
+    res.set('Cache-Control', 'no-store').json({ server: { id: guild.id, name: guild.name }, channels: textChannels });
+  } catch (err) {
+    logEvent('error', { event: 'owner_channel_list_failed', guildId, status: err.status || null });
+    res.status(err.status === 403 || err.status === 404 ? 403 : 502).json({ error: 'Could not list channels. Confirm the bot is installed in this server and has permission to view channels.' });
+  }
+});
+
+app.post('/owner/api/messages', requireOwner, async (req, res) => {
+  const guildId = String(req.body?.guildId || '');
+  const channelId = String(req.body?.channelId || '');
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  if (!/^\d{17,22}$/.test(guildId) || !/^\d{17,22}$/.test(channelId)) return res.status(400).json({ error: 'Choose a valid server and channel.' });
+  if (!content || content.length > 1800) return res.status(400).json({ error: 'Message must contain 1–1800 characters.' });
+  if (!store.users.some(u => (u.guilds || []).some(g => g.id === guildId))) return res.status(403).json({ error: 'That server is not linked to a Lumio-connected account.' });
+  try {
+    const channels = await discordRequest(`/guilds/${guildId}/channels`, { headers: { Authorization: `Bot ${BOT_TOKEN}` } });
+    const channel = (Array.isArray(channels) ? channels : []).find(ch => ch.id === channelId && [0, 5].includes(ch.type));
+    if (!channel) return res.status(400).json({ error: 'That channel is not a text or announcement channel in the selected server.' });
+    const result = await discordRequest(`/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
+    });
+    audit('announcement_sent', { guildId, channelId, messageId: result.id, characterCount: content.length });
+    res.json({ ok: true, messageId: result.id });
+  } catch (err) {
+    logEvent('error', { event: 'owner_announcement_failed', guildId, channelId, status: err.status || null });
+    res.status(err.status === 403 ? 403 : 502).json({ error: 'Message failed. Confirm the bot has View Channel and Send Messages permissions.' });
+  }
+});
+
+app.post('/owner/api/users/:discordId/suspend', requireOwner, (req, res) => {
+  const discordId = String(req.params.discordId || '');
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 300) : '';
+  const user = store.users.find(u => u.discordId === discordId);
+  if (!user) return res.status(404).json({ error: 'Linked user not found.' });
+  if (!reason) return res.status(400).json({ error: 'Enter a reason for the suspension.' });
+  user.suspended = true;
+  user.suspensionReason = reason;
+  user.suspendedAt = new Date().toISOString();
+  audit('user_suspended', { discordId, reason });
+  res.json({ ok: true, user: publicUser(user) });
+});
+
+app.post('/owner/api/users/:discordId/restore', requireOwner, (req, res) => {
+  const discordId = String(req.params.discordId || '');
+  const user = store.users.find(u => u.discordId === discordId);
+  if (!user) return res.status(404).json({ error: 'Linked user not found.' });
+  user.suspended = false;
+  user.suspensionReason = null;
+  delete user.suspendedAt;
+  audit('user_restored', { discordId });
+  res.json({ ok: true, user: publicUser(user) });
+});
+
 // Begin OAuth2. State stored in the session protects against forged callbacks.
 app.get('/discord/login', oauthLimiter, (req, res) => {
   if (!configReady(res)) return;
@@ -400,7 +538,7 @@ app.get('/discord/login', oauthLimiter, (req, res) => {
     client_id: CLIENT_ID,
     response_type: 'code',
     redirect_uri: REDIRECT_URI,
-    scope: 'identify role_connections.write',
+    scope: 'identify guilds role_connections.write',
     state,
     prompt: 'consent',
   });
@@ -443,7 +581,14 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
     const user = await discordRequest('/users/@me', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
-
+    const oauthGuilds = await discordRequest('/users/@me/guilds', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const existingUser = store.users.find((item) => item.discordId === user.id);
+    if (existingUser?.suspended) {
+      audit('suspended_link_attempt', { discordId: user.id });
+      return res.status(403).send('This Discord account is currently suspended from Lumio. If you believe this is a mistake, contact the project owner.');
+    }
     // EXAMPLE ONLY: replace with truthful, calculated eligibility values and matching metadata.
     const metadata = { verified: 1, account_age_days: 0 };
     await discordRequest(`/users/@me/applications/${CLIENT_ID}/role-connection`, {
@@ -458,6 +603,26 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
         metadata,
       }),
     });
+
+    const linkedRecord = {
+      discordId: user.id,
+      username: String(user.username || 'Unknown').slice(0, 100),
+      globalName: String(user.global_name || '').slice(0, 100) || null,
+      avatar: user.avatar || null,
+      linkedAt: existingUser?.linkedAt || new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+      suspended: false,
+      suspensionReason: null,
+      guilds: Array.isArray(oauthGuilds) ? oauthGuilds.map(g => ({
+        id: String(g.id), name: String(g.name || 'Unknown server').slice(0, 100),
+        owner: Boolean(g.owner), permissions: String(g.permissions || ''),
+      })).slice(0, 200) : [],
+    };
+    const existingIndex = store.users.findIndex((item) => item.discordId === user.id);
+    if (existingIndex >= 0) store.users[existingIndex] = { ...store.users[existingIndex], ...linkedRecord };
+    else store.users.unshift(linkedRecord);
+    saveStore();
+    audit('account_linked', { discordId: user.id, guildCount: linkedRecord.guilds.length });
 
     logEvent('action', { event: 'linked_role_metadata_updated', discordUserId: user.id });
     res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verification complete</title><body style="font:16px system-ui;max-width:600px;margin:12vh auto;padding:24px;color:#183c32"><h1>Account connected</h1><p>Your Discord account was connected and a linked-role metadata update was submitted.</p><p>If the role is not assigned, check the linked-role configuration and metadata requirements in Discord.</p></body></html>`);
