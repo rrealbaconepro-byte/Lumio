@@ -306,7 +306,19 @@ function requireAdmin(req, res, next) {
 }
 
 async function discordRequest(path, options = {}) {
-  const response = await fetch(`https://discord.com/api/v10${path}`, options);
+  // Never let a stalled Discord API request leave the owner panel spinning forever.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  let response;
+  try {
+    response = await fetch(`https://discord.com/api/v10${path}`, { ...options, signal: controller.signal });
+  } catch (err) {
+    const wrapped = new Error(err.name === 'AbortError' ? 'Discord API request timed out.' : 'Could not reach Discord API.');
+    wrapped.status = 504;
+    throw wrapped;
+  } finally {
+    clearTimeout(timeout);
+  }
   const text = await response.text();
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
@@ -388,12 +400,16 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
 // Do not hard-code it into source code or commit it to GitHub.
 app.get('/owner', (req, res) => {
   res.set('Cache-Control', 'no-store');
+  // Helmet's default CSP blocks inline scripts. Give this owner page a one-use nonce
+  // so its dashboard JavaScript can run without allowing arbitrary inline scripts.
+  const cspNonce = crypto.randomBytes(18).toString('base64');
+  res.set('Content-Security-Policy', `default-src 'self'; script-src 'self' 'nonce-${cspNonce}'; style-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'none'; form-action 'self' https://discord.com; object-src 'none'; upgrade-insecure-requests`);
   if (req.session.ownerAuthenticated !== true) return res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Access</title><body style="font:16px system-ui;max-width:480px;margin:12vh auto;padding:24px;background:#e8f8ef;color:#183c32"><h1>Lumio Owner Panel</h1><p>Enter the owner passcode to continue.</p><form method="post" action="/owner/login"><label>Owner passcode <input name="passcode" type="password" autocomplete="current-password" required maxlength="256" style="display:block;width:100%;padding:12px;margin:8px 0"></label><button style="padding:12px;background:#226b4e;color:white;border:0;border-radius:10px">Unlock panel</button></form></body></html>`);
   return res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lumio Owner Panel</title><style>body{font:15px system-ui;margin:0;padding:20px;background:#e8f8ef;color:#183c32}main{max-width:1100px;margin:auto;background:#fff;padding:24px;border-radius:18px}section{margin:24px 0}.grid{display:flex;gap:12px;flex-wrap:wrap}.card{padding:14px;border:1px solid #cde4d6;border-radius:12px;min-width:150px}button{padding:9px 13px;border:0;border-radius:9px;background:#226b4e;color:#fff;cursor:pointer}button.danger{background:#9e2d2d}select,textarea{display:block;width:100%;box-sizing:border-box;padding:10px;margin:8px 0 14px;border:1px solid #bdd8c9;border-radius:9px}textarea{min-height:100px}table{border-collapse:collapse;width:100%;min-width:700px}td,th{text-align:left;padding:10px;border-bottom:1px solid #dcebe2}.wrap{overflow:auto}#notice{padding:10px;background:#eff9f2;white-space:pre-wrap}small{color:#60776c}</style></head><body><main><header style="display:flex;justify-content:space-between;align-items:center;gap:12px"><div><small>LUMIO / PRIVATE OWNER AREA</small><h1>Lumio Owner Panel</h1><p>Linked accounts, server announcements and moderation.</p></div><form method="post" action="/owner/logout"><button type="submit">Lock panel</button></form></header><p id="notice">Loading…</p><div class="grid"><div class="card">Linked accounts<h2 id="totalUsers">—</h2></div><div class="card">Suspended<h2 id="totalSuspended">—</h2></div><div class="card">Connected servers<h2 id="totalServers">—</h2></div></div><section><h2>Send a server announcement</h2><p><small>Choose one server and channel. The bot must be installed and have permission. Mentions are disabled.</small></p><label>Server<select id="server"><option value="">Choose server</option></select></label><label>Channel<select id="channel"><option value="">Choose a server first</option></select></label><label>Message<textarea id="message" maxlength="1800" placeholder="Write your announcement"></textarea></label><button id="send">Send announcement</button></section><section><h2>Linked accounts</h2><div class="wrap"><table><thead><tr><th>Account</th><th>Linked at</th><th>Servers</th><th>Status</th><th>Action</th></tr></thead><tbody id="users"><tr><td colspan="5">Loading…</td></tr></tbody></table></div></section><section><h2>Recent owner actions</h2><div class="wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead><tbody id="audit"></tbody></table></div></section>
-<script>
+<script nonce="${cspNonce}">
 const $=id=>document.getElementById(id);function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function note(s){$('notice').textContent=s}
-async function api(url,opts={}){const r=await fetch(url,{credentials:'same-origin',...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.error||'Request failed');return d}
-async function load(){try{const d=await api('/owner/api/overview');$('totalUsers').textContent=d.totals.linkedUsers;$('totalSuspended').textContent=d.totals.suspendedUsers;$('totalServers').textContent=d.totals.connectedServers;$('server').innerHTML='<option value="">Choose server</option>'+d.servers.map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+' ('+g.linkedAccounts+' linked)</option>').join('');$('users').innerHTML=d.users.length?d.users.map(u=>'<tr><td><b>'+esc(u.globalName||u.username)+'</b><br><small>'+esc(u.username)+' · '+esc(u.discordId)+'</small></td><td>'+esc(new Date(u.linkedAt).toLocaleString())+'</td><td>'+u.guilds.length+'</td><td>'+(u.suspended?'Suspended: '+esc(u.suspensionReason||''):'Active')+'</td><td>'+(u.suspended?'<button data-restore="'+esc(u.discordId)+'">Restore</button>':'<button class="danger" data-suspend="'+esc(u.discordId)+'">Suspend</button>')+'</td></tr>').join(''):'<tr><td colspan="5">No linked accounts yet.</td></tr>';$('audit').innerHTML=d.audit.map(a=>'<tr><td>'+esc(new Date(a.at).toLocaleString())+'</td><td>'+esc(a.action)+'</td><td><small>'+esc(Object.entries(a).filter(([k])=>!['at','action'].includes(k)).map(([k,v])=>k+': '+(typeof v==='string'?v:JSON.stringify(v))).join(' · '))+'</small></td></tr>').join('');note('Dashboard loaded.')}catch(e){note(e.message)}}
+async function api(url,opts={}){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),12000);let r;try{r=await fetch(url,{credentials:'same-origin',...opts,signal:controller.signal,headers:{'Content-Type':'application/json',...(opts.headers||{})}})}catch(e){if(e.name==='AbortError')throw Error('Request timed out after 12 seconds. Check Render logs and try again.');throw Error('Could not reach Lumio server. Check your connection and Render status.')}finally{clearTimeout(timer)}let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.error||('Request failed ('+r.status+')'));return d}
+async function load(){note('Loading owner dashboard…');try{const d=await api('/owner/api/overview');$('totalUsers').textContent=d.totals.linkedUsers;$('totalSuspended').textContent=d.totals.suspendedUsers;$('totalServers').textContent=d.totals.connectedServers;$('server').innerHTML='<option value="">Choose server</option>'+d.servers.map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+' ('+g.linkedAccounts+' linked)</option>').join('');$('users').innerHTML=d.users.length?d.users.map(u=>'<tr><td><b>'+esc(u.globalName||u.username)+'</b><br><small>'+esc(u.username)+' · '+esc(u.discordId)+'</small></td><td>'+esc(new Date(u.linkedAt).toLocaleString())+'</td><td>'+u.guilds.length+'</td><td>'+(u.suspended?'Suspended: '+esc(u.suspensionReason||''):'Active')+'</td><td>'+(u.suspended?'<button data-restore="'+esc(u.discordId)+'">Restore</button>':'<button class="danger" data-suspend="'+esc(u.discordId)+'">Suspend</button>')+'</td></tr>').join(''):'<tr><td colspan="5">No linked accounts yet.</td></tr>';$('audit').innerHTML=d.audit.map(a=>'<tr><td>'+esc(new Date(a.at).toLocaleString())+'</td><td>'+esc(a.action)+'</td><td><small>'+esc(Object.entries(a).filter(([k])=>!['at','action'].includes(k)).map(([k,v])=>k+': '+(typeof v==='string'?v:JSON.stringify(v))).join(' · '))+'</small></td></tr>').join('');note('Dashboard loaded.')}catch(e){note(e.message)}}
 $('server').onchange=async()=>{const id=$('server').value;$('channel').innerHTML='<option>Loading…</option>';if(!id){$('channel').innerHTML='<option value="">Choose a server first</option>';return}try{const d=await api('/owner/api/servers/'+encodeURIComponent(id)+'/channels');$('channel').innerHTML='<option value="">Choose channel</option>'+d.channels.map(c=>'<option value="'+esc(c.id)+'">#'+esc(c.name)+'</option>').join('')}catch(e){$('channel').innerHTML='<option value="">Could not load channels</option>';note(e.message)}};
 $('send').onclick=async()=>{const guildId=$('server').value,channelId=$('channel').value,content=$('message').value.trim();if(!guildId||!channelId||!content)return note('Choose a server, channel and message.');if(!confirm('Send this announcement to the selected channel?'))return;try{await api('/owner/api/messages',{method:'POST',body:JSON.stringify({guildId,channelId,content})});$('message').value='';note('Announcement sent.');load()}catch(e){note(e.message)}};
 document.addEventListener('click',async e=>{const s=e.target.closest('[data-suspend]'),r=e.target.closest('[data-restore]');try{if(s){const reason=prompt('Reason for suspending this Lumio-linked account:');if(!reason||!reason.trim()||!confirm('Suspend this account from Lumio linking?'))return;await api('/owner/api/users/'+s.dataset.suspend+'/suspend',{method:'POST',body:JSON.stringify({reason})});note('Account suspended from Lumio.');load()}if(r){if(!confirm('Restore this account’s Lumio access?'))return;await api('/owner/api/users/'+r.dataset.restore+'/restore',{method:'POST',body:'{}'});note('Account restored.');load()}}catch(err){note(err.message)}});load();
@@ -560,6 +576,7 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
   }
   delete req.session.oauthState;
 
+  let oauthStage = 'token_exchange';
   try {
     const tokenResponse = await fetch('https://discord.com/api/v10/oauth2/token', {
       method: 'POST',
@@ -572,15 +589,35 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
         redirect_uri: REDIRECT_URI,
       }),
     });
-    const tokenData = await tokenResponse.json();
-    if (!tokenResponse.ok || !tokenData.access_token) {
-      logEvent('error', { event: 'oauth_token_exchange_failed', status: tokenResponse.status });
+    // Read as text first: some upstream/proxy failures return an HTML page instead
+    // of Discord's JSON response. Never try to blindly parse HTML as JSON.
+    const tokenContentType = tokenResponse.headers.get('content-type') || '';
+    const tokenBodyText = await tokenResponse.text();
+    let tokenData = null;
+    try {
+      tokenData = tokenBodyText ? JSON.parse(tokenBodyText) : {};
+    } catch {
+      logEvent('error', {
+        event: 'oauth_token_exchange_non_json',
+        status: tokenResponse.status,
+        contentType: tokenContentType.slice(0, 100),
+      });
+      return res.status(502).send('Discord returned an unexpected response during sign-in. Please try again later.');
+    }
+    if (!tokenResponse.ok || !tokenData || !tokenData.access_token) {
+      logEvent('error', {
+        event: 'oauth_token_exchange_failed',
+        status: tokenResponse.status,
+        error: typeof tokenData?.error === 'string' ? tokenData.error.slice(0, 80) : undefined,
+      });
       return res.status(502).send('Discord sign-in failed. Please try again later.');
     }
 
+    oauthStage = 'fetch_user';
     const user = await discordRequest('/users/@me', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
+    oauthStage = 'fetch_authorized_guilds';
     const oauthGuilds = await discordRequest('/users/@me/guilds', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
@@ -591,6 +628,7 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
     }
     // EXAMPLE ONLY: replace with truthful, calculated eligibility values and matching metadata.
     const metadata = { verified: 1, account_age_days: 0 };
+    oauthStage = 'update_linked_role_metadata';
     await discordRequest(`/users/@me/applications/${CLIENT_ID}/role-connection`, {
       method: 'PUT',
       headers: {
@@ -627,7 +665,12 @@ app.get('/discord/callback', oauthLimiter, async (req, res) => {
     logEvent('action', { event: 'linked_role_metadata_updated', discordUserId: user.id });
     res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verification complete</title><body style="font:16px system-ui;max-width:600px;margin:12vh auto;padding:24px;color:#183c32"><h1>Account connected</h1><p>Your Discord account was connected and a linked-role metadata update was submitted.</p><p>If the role is not assigned, check the linked-role configuration and metadata requirements in Discord.</p></body></html>`);
   } catch (err) {
-    logEvent('error', { event: 'oauth_verification_failed', message: err.message });
+    logEvent('error', {
+      event: 'oauth_verification_failed',
+      stage: oauthStage,
+      message: String(err.message || 'Unknown error').slice(0, 180),
+      status: Number.isInteger(err.status) ? err.status : undefined,
+    });
     res.status(502).send('Verification could not be completed. Please try again later.');
   }
 });
